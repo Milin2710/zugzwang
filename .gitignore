@@ -1,0 +1,19 @@
+# dependencies and build output
+node_modules/
+.next/
+dist/
+coverage/
+
+# secrets: never commit real env files
+.env
+.env.*
+!.env.example
+
+# editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# logs
+*.log

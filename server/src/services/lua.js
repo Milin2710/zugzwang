@@ -1,0 +1,110 @@
+// Lua scripts run atomically inside Redis, which is what makes matchmaking safe
+// when several server instances are racing to pair the same players.
+
+/**
+ * Either pair the caller with the best waiting opponent and create the game,
+ * or put the caller into the queue.
+ *
+ * KEYS: 1 queue(zset username->rating)  2 entries(hash username->json)  3 clock-deadlines(zset)
+ * ARGV: 1 prefix 2 username 3 rating 4 socketId 5 now 6 baseWindow 7 growthPerSec
+ *       8 gameId 9 startFen 10 initialMs 11 incMs 12 firstMoveMs 13 flip(0|1) 14 ttlSec
+ * Returns: {"matched", gameId} | {"queued"} | {"in_game", gameId}
+ */
+export const MATCH_OR_QUEUE = `
+local prefix = ARGV[1]
+local username = ARGV[2]
+local rating = tonumber(ARGV[3])
+local socketId = ARGV[4]
+local now = tonumber(ARGV[5])
+local baseWindow = tonumber(ARGV[6])
+local growth = tonumber(ARGV[7])
+local gameId = ARGV[8]
+local startFen = ARGV[9]
+local initialMs = ARGV[10]
+local incMs = ARGV[11]
+local firstMoveMs = tonumber(ARGV[12])
+local flip = tonumber(ARGV[13])
+local ttl = tonumber(ARGV[14])
+
+local function activeGame(user)
+  local gid = redis.call('GET', prefix .. 'user:' .. user .. ':game')
+  if not gid then return nil end
+  if redis.call('HGET', prefix .. 'game:' .. gid, 'status') == 'active' then return gid end
+  redis.call('DEL', prefix .. 'user:' .. user .. ':game') -- stale pointer
+  return nil
+end
+
+local current = activeGame(username)
+if current then return {'in_game', current} end
+
+local best, bestDiff, bestTs, bestRating
+local members = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+for i = 1, #members, 2 do
+  local name = members[i]
+  local score = tonumber(members[i + 1])
+  if name ~= username then
+    local raw = redis.call('HGET', KEYS[2], name)
+    if (not raw) or activeGame(name) then
+      redis.call('ZREM', KEYS[1], name) -- orphan / already playing
+      redis.call('HDEL', KEYS[2], name)
+    else
+      local e = cjson.decode(raw)
+      -- the longer someone waits, the wider the rating gap they accept
+      local window = baseWindow + growth * ((now - e.ts) / 1000)
+      local diff = math.abs(score - rating)
+      if diff <= window and ((not best) or diff < bestDiff or (diff == bestDiff and e.ts < bestTs)) then
+        best, bestDiff, bestTs, bestRating = name, diff, e.ts, score
+      end
+    end
+  end
+end
+
+if best then
+  redis.call('ZREM', KEYS[1], best, username)
+  redis.call('HDEL', KEYS[2], best, username)
+  local white, black, wr, br
+  if flip == 0 then white, black, wr, br = best, username, bestRating, rating
+  else white, black, wr, br = username, best, rating, bestRating end
+  local gkey = prefix .. 'game:' .. gameId
+  redis.call('HSET', gkey,
+    'id', gameId, 'white', white, 'black', black,
+    'whiteRating', wr, 'blackRating', br,
+    'fen', startFen, 'turn', 'w', 'moveCount', 0,
+    'whiteMs', initialMs, 'blackMs', initialMs, 'incMs', incMs,
+    'lastMoveAt', now, 'startedAt', now, 'status', 'active',
+    'drawOffer', '', 'drawOfferPlyW', -1, 'drawOfferPlyB', -1,
+    'disconnectW', 0, 'disconnectB', 0)
+  redis.call('EXPIRE', gkey, ttl)
+  redis.call('SET', prefix .. 'user:' .. white .. ':game', gameId, 'EX', ttl)
+  redis.call('SET', prefix .. 'user:' .. black .. ':game', gameId, 'EX', ttl)
+  redis.call('ZADD', KEYS[3], now + firstMoveMs, gameId)
+  return {'matched', gameId}
+end
+
+local existing = redis.call('HGET', KEYS[2], username)
+local ts = now
+if existing then ts = cjson.decode(existing).ts end
+redis.call('HSET', KEYS[2], username, cjson.encode({socketId = socketId, rating = rating, ts = ts}))
+redis.call('ZADD', KEYS[1], rating, username)
+return {'queued'}
+`;
+
+/**
+ * Remove a user from the queue. If socketId is non-empty, only when that socket
+ * is the one that queued (so a closed old tab can't cancel a newer tab's search).
+ * KEYS: 1 queue  2 entries   ARGV: 1 username  2 socketId|''
+ */
+export const DEQUEUE = `
+local raw = redis.call('HGET', KEYS[2], ARGV[1])
+if not raw then return 0 end
+if ARGV[2] ~= '' and cjson.decode(raw).socketId ~= ARGV[2] then return 0 end
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+return 1
+`;
+
+/** Release a lock only if we still own it. KEYS: 1 lock  ARGV: 1 token */
+export const RELEASE_LOCK = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+`;
