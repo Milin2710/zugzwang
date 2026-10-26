@@ -189,6 +189,20 @@ export function createGameService({ store, persistence, emitter, config, logger,
     await broadcastState(g, await store.getMoves(gameId));
   }
 
+  /**
+   * Pair people who are already waiting. A new joiner is matched on the spot by joinQueue, but the
+   * accepted rating gap keeps growing while someone waits, so the sweeper calls this every tick.
+   */
+  async function matchPass() {
+    const ids = await store.matchPass({
+      now: now(),
+      baseWindow: mm.baseWindow, growthPerSec: mm.windowGrowthPerSec,
+      startFen: START_FEN, initialMs: gc.initialMs, incMs: gc.incrementMs, firstMoveMs: gc.firstMoveMs,
+    });
+    for (const id of ids) await announce(id);
+    return ids.length;
+  }
+
   async function leaveQueue(username, socketId) {
     return store.dequeue(username, socketId);
   }
@@ -371,6 +385,7 @@ export function createGameService({ store, persistence, emitter, config, logger,
 
   /** One pass over everything that is due. Safe to run concurrently on every instance. */
   async function sweep() {
+    await matchPass().catch((err) => logger.error("matchmaking pass failed", { err }));
     const t = now();
     for (const id of await store.dueClock(t)) {
       await handleClockDeadline(id).catch((err) => logger.error("clock deadline failed", { gameId: id, err }));
@@ -381,7 +396,7 @@ export function createGameService({ store, persistence, emitter, config, logger,
   }
 
   return {
-    joinQueue, leaveQueue,
+    joinQueue, leaveQueue, matchPass,
     makeMove, resign, offerDraw, acceptDraw, declineDraw,
     onUserOffline, onUserOnline, getSnapshot,
     handleClockDeadline, handleAbandonDeadline, sweep,

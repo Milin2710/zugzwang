@@ -1,0 +1,9 @@
+# Caddy gets and renews HTTPS certificates automatically, and proxies WebSocket upgrades as-is.
+{$APP_DOMAIN} {
+	encode gzip
+	reverse_proxy client:3000
+}
+
+{$API_DOMAIN} {
+	reverse_proxy server:4000
+}

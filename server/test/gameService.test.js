@@ -61,6 +61,37 @@ test("rating window: far apart players wait, then match as the window widens", a
   assert.equal(r2.status, "matched");
 });
 
+test("two players already waiting are paired by the periodic pass once the window widens", async () => {
+  const a = makeInstance(redis, { clock });
+  const b = makeInstance(redis, { clock });
+  await a.service.joinQueue({ username: "low", rating: 1200, socketId: "a" });
+  assert.equal((await b.service.joinQueue({ username: "high", rating: 1800, socketId: "b" })).status, "queued");
+
+  assert.equal(await a.service.matchPass(), 0, "gap 600 > window 100: nothing yet");
+  clock.advance(30_000); // low waited 30s -> window 700
+  assert.equal(await b.service.matchPass(), 1, "no new join, but the pass pairs them");
+  assert.equal(await a.service.matchPass(), 0, "and only once");
+
+  const g = await a.service.getSnapshot("low");
+  assert.equal(g.status, "active");
+  assert.equal((await b.service.getSnapshot("high")).id, g.id);
+  assert.equal(b.emitter.last("low", "game:state").id, g.id, "players are told about the game");
+});
+
+test("the periodic pass pairs the closest ratings, oldest waiter first, and never double-books", async () => {
+  const inst = makeInstance(redis, { clock });
+  await inst.service.joinQueue({ username: "p1", rating: 1000, socketId: "1" });
+  clock.advance(1_000);
+  await inst.service.joinQueue({ username: "p2", rating: 1600, socketId: "2" });
+  clock.advance(1_000);
+  await inst.service.joinQueue({ username: "p3", rating: 1050, socketId: "3" }); // matches p1 right away (gap 50)
+  assert.equal((await inst.service.getSnapshot("p1")).status, "active");
+  clock.advance(120_000);
+  await inst.service.joinQueue({ username: "p4", rating: 1700, socketId: "4" }); // p2 waited 120s -> matches
+  assert.equal((await inst.service.getSnapshot("p2")).status, "active");
+  assert.equal(await inst.service.matchPass(), 0);
+});
+
 test("leaving the queue removes you", async () => {
   const inst = makeInstance(redis, { clock });
   await inst.service.joinQueue({ username: "alice", rating: 1200, socketId: "a" });

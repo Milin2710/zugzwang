@@ -1,6 +1,37 @@
 // Lua scripts run atomically inside Redis, which is what makes matchmaking safe
 // when several server instances are racing to pair the same players.
 
+
+/**
+ * Shared Lua helpers, inlined into every script that needs them (a script can't import another).
+ * Expects these locals to exist already: prefix, now, startFen, initialMs, incMs, firstMoveMs, ttl, and KEYS[3].
+ */
+const SHARED_LUA = `
+local function activeGame(user)
+  local gid = redis.call('GET', prefix .. 'user:' .. user .. ':game')
+  if not gid then return nil end
+  if redis.call('HGET', prefix .. 'game:' .. gid, 'status') == 'active' then return gid end
+  redis.call('DEL', prefix .. 'user:' .. user .. ':game') -- stale pointer
+  return nil
+end
+
+local function createGame(gameId, white, black, wr, br)
+  local gkey = prefix .. 'game:' .. gameId
+  redis.call('HSET', gkey,
+    'id', gameId, 'white', white, 'black', black,
+    'whiteRating', wr, 'blackRating', br,
+    'fen', startFen, 'turn', 'w', 'moveCount', 0,
+    'whiteMs', initialMs, 'blackMs', initialMs, 'incMs', incMs,
+    'lastMoveAt', now, 'startedAt', now, 'status', 'active',
+    'drawOffer', '', 'drawOfferPlyW', -1, 'drawOfferPlyB', -1,
+    'disconnectW', 0, 'disconnectB', 0)
+  redis.call('EXPIRE', gkey, ttl)
+  redis.call('SET', prefix .. 'user:' .. white .. ':game', gameId, 'EX', ttl)
+  redis.call('SET', prefix .. 'user:' .. black .. ':game', gameId, 'EX', ttl)
+  redis.call('ZADD', KEYS[3], now + firstMoveMs, gameId)
+end
+`;
+
 /**
  * Either pair the caller with the best waiting opponent and create the game,
  * or put the caller into the queue.
@@ -26,14 +57,7 @@ local firstMoveMs = tonumber(ARGV[12])
 local flip = tonumber(ARGV[13])
 local ttl = tonumber(ARGV[14])
 
-local function activeGame(user)
-  local gid = redis.call('GET', prefix .. 'user:' .. user .. ':game')
-  if not gid then return nil end
-  if redis.call('HGET', prefix .. 'game:' .. gid, 'status') == 'active' then return gid end
-  redis.call('DEL', prefix .. 'user:' .. user .. ':game') -- stale pointer
-  return nil
-end
-
+${SHARED_LUA}
 local current = activeGame(username)
 if current then return {'in_game', current} end
 
@@ -65,19 +89,7 @@ if best then
   local white, black, wr, br
   if flip == 0 then white, black, wr, br = best, username, bestRating, rating
   else white, black, wr, br = username, best, rating, bestRating end
-  local gkey = prefix .. 'game:' .. gameId
-  redis.call('HSET', gkey,
-    'id', gameId, 'white', white, 'black', black,
-    'whiteRating', wr, 'blackRating', br,
-    'fen', startFen, 'turn', 'w', 'moveCount', 0,
-    'whiteMs', initialMs, 'blackMs', initialMs, 'incMs', incMs,
-    'lastMoveAt', now, 'startedAt', now, 'status', 'active',
-    'drawOffer', '', 'drawOfferPlyW', -1, 'drawOfferPlyB', -1,
-    'disconnectW', 0, 'disconnectB', 0)
-  redis.call('EXPIRE', gkey, ttl)
-  redis.call('SET', prefix .. 'user:' .. white .. ':game', gameId, 'EX', ttl)
-  redis.call('SET', prefix .. 'user:' .. black .. ':game', gameId, 'EX', ttl)
-  redis.call('ZADD', KEYS[3], now + firstMoveMs, gameId)
+  createGame(gameId, white, black, wr, br)
   return {'matched', gameId}
 end
 
@@ -107,4 +119,79 @@ return 1
 export const RELEASE_LOCK = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
 return 0
+`;
+
+/**
+ * A matchmaking pass with no caller: pair people who are ALREADY waiting.
+ * Needed because the accepted rating gap grows with waiting time, but MATCH_OR_QUEUE only
+ * runs when somebody new joins. Oldest waiter first; each takes the closest rating within
+ * their own (widest) window. Runs once per sweeper tick, so it stays cheap when the queue is small.
+ *
+ * KEYS: 1 queue  2 entries  3 clock-deadlines
+ * ARGV: 1 prefix 2 now 3 baseWindow 4 growthPerSec 5 startFen 6 initialMs 7 incMs 8 firstMoveMs 9 ttlSec
+ *       10.. repeated pairs: gameId, flip(0|1)   (one pair per game that may be created)
+ * Returns: list of created game ids
+ */
+export const MATCH_PASS = `
+local prefix = ARGV[1]
+local now = tonumber(ARGV[2])
+local baseWindow = tonumber(ARGV[3])
+local growth = tonumber(ARGV[4])
+local startFen = ARGV[5]
+local initialMs = ARGV[6]
+local incMs = ARGV[7]
+local firstMoveMs = tonumber(ARGV[8])
+local ttl = tonumber(ARGV[9])
+
+if redis.call('ZCARD', KEYS[1]) < 2 then return {} end
+
+${SHARED_LUA}
+
+local waiting = {}
+local members = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+for i = 1, #members, 2 do
+  local name = members[i]
+  local raw = redis.call('HGET', KEYS[2], name)
+  if (not raw) or activeGame(name) then
+    redis.call('ZREM', KEYS[1], name) -- orphan / already playing
+    redis.call('HDEL', KEYS[2], name)
+  else
+    waiting[#waiting + 1] = { name = name, rating = tonumber(members[i + 1]), ts = cjson.decode(raw).ts }
+  end
+end
+table.sort(waiting, function(a, b)
+  if a.ts ~= b.ts then return a.ts < b.ts end
+  return a.name < b.name
+end)
+
+local used = {}
+local created = {}
+local nextArg = 10
+for i = 1, #waiting do
+  local a = waiting[i]
+  if (not used[a.name]) and nextArg + 1 <= #ARGV then
+    local window = baseWindow + growth * ((now - a.ts) / 1000)
+    local best, bestDiff
+    for j = i + 1, #waiting do
+      local b = waiting[j]
+      if not used[b.name] then
+        local diff = math.abs(a.rating - b.rating)
+        if diff <= window and ((not best) or diff < bestDiff) then best, bestDiff = b, diff end
+      end
+    end
+    if best then
+      used[a.name] = true
+      used[best.name] = true
+      redis.call('ZREM', KEYS[1], a.name, best.name)
+      redis.call('HDEL', KEYS[2], a.name, best.name)
+      local gameId = ARGV[nextArg]
+      local flip = tonumber(ARGV[nextArg + 1])
+      nextArg = nextArg + 2
+      if flip == 0 then createGame(gameId, a.name, best.name, a.rating, best.rating)
+      else createGame(gameId, best.name, a.name, best.rating, a.rating) end
+      created[#created + 1] = gameId
+    end
+  end
+end
+return created
 `;

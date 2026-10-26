@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { DEQUEUE, MATCH_OR_QUEUE, RELEASE_LOCK } from "./lua.js";
+import { DEQUEUE, MATCH_OR_QUEUE, MATCH_PASS, RELEASE_LOCK } from "./lua.js";
 
 export const P = "chess:";
 const k = {
@@ -44,6 +44,20 @@ export class GameStore {
       ],
     });
     return { kind: res[0], gameId: res[1] };
+  }
+
+  /** Pair players who are already waiting (their accepted gap grows with time). Returns the new game ids. */
+  async matchPass({ now, baseWindow, growthPerSec, startFen, initialMs, incMs, firstMoveMs, maxGames = 10 }) {
+    const pairs = [];
+    for (let i = 0; i < maxGames; i++) pairs.push(randomUUID(), String(Math.random() < 0.5 ? 0 : 1));
+    return this.redis.eval(MATCH_PASS, {
+      keys: [k.queue, k.entries, k.clockDeadlines],
+      arguments: [
+        P, String(now), String(baseWindow), String(growthPerSec), startFen,
+        String(initialMs), String(incMs), String(firstMoveMs), String(this.activeTtlSec),
+        ...pairs,
+      ],
+    });
   }
 
   async dequeue(username, socketId = "") {
