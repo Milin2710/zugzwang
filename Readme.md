@@ -5,6 +5,11 @@ Sign in, get matched with a player of similar rating, and play a full game of ch
 The project focuses on **server-authoritative game logic, atomic matchmaking, and a real-time layer that scales horizontally**: any server instance can serve any player, and no game state lives in process memory.
 
 <p align="center">
+  <b>🔗 Live demo: <a href="https://zugzwang-app.duckdns.org">zugzwang-app.duckdns.org</a></b><br>
+  <sub>Sign up, then open a second browser (or a friend) to get matched.</sub>
+</p>
+
+<p align="center">
   <img src="./readme-assets/landing.png" alt="Zugzwang home page" width="900">
 </p>
 
@@ -417,7 +422,7 @@ cd server && npm run stats:rebuild
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `4000` | HTTP and WebSocket port |
-| `MONGODB_URI` | `mongodb://localhost:27017/zugzwang` | MongoDB connection string |
+| `MONGODB_URI` | `mongodb://localhost:27017/chessing` | MongoDB connection string |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
 | `CLERK_SECRET_KEY` | *(required)* | Used to verify session tokens and read usernames |
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated frontend origins (CORS and Clerk authorized parties) |
@@ -445,7 +450,7 @@ redis-server --port 6390 --save "" &      # or: TEST_REDIS_URL=redis://localhost
 npm test
 ```
 
-The suite (60 tests) covers:
+The suite (62 tests) covers:
 - **Rating maths** and the material rules (timeout vs insufficient material).
 - **Game service against a real Redis:** legal and illegal moves, turn order, clocks, draws, resignation, reconnects, and racing resign / disconnect / timeout settling exactly once.
 - **API behaviour** with mocked models: auth gating, validation, pagination, leaderboard ranks and ties, explorer keys, and the privacy of practice games.
@@ -455,16 +460,35 @@ The suite (60 tests) covers:
 
 ## 🚀 Deployment
 
-The client is a standard Next.js app and fits **Vercel**. The server holds long-lived WebSocket connections and a 1-second sweeper, so it needs a host that keeps a Node process running (Render, Railway, a VPS) rather than serverless functions.
+Live at **[zugzwang-app.duckdns.org](https://zugzwang-app.duckdns.org)**, running on a single AWS EC2 server with Docker Compose.
 
-| Part | Option |
+```mermaid
+flowchart LR
+  B[Browser] -->|HTTPS / WSS| C[Caddy<br/>automatic TLS]
+  C --> W[Next.js client]
+  C --> S[Node server<br/>Express + Socket.IO]
+  S --> R[(Redis<br/>append-only file)]
+  S --> M[(MongoDB Atlas)]
+  S -.verify.-> K[Clerk]
+```
+
+| Part | Where it runs |
 |---|---|
-| Client | Vercel |
-| Server | Render, Railway, or any VPS running Node (a `docker-compose` with Caddy works well) |
-| MongoDB | MongoDB Atlas (free tier) |
-| Redis | Upstash or Redis Cloud (free tiers), or Redis on the same host |
+| Reverse proxy | Caddy: free HTTPS certificates, WebSocket proxying |
+| Client and server | Docker containers on EC2 (Ubuntu) |
+| Redis | Container on the same host, with `appendonly yes` and a volume |
+| MongoDB | MongoDB Atlas free tier, restricted to the server's IP |
+| DNS | Free DuckDNS names pointing at an Elastic IP |
 
-Set `NEXT_PUBLIC_BACKEND_URL` to the server's `https` URL, add the client's origin to `CORS_ORIGINS`, and add it to Clerk's allowed origins. Free tiers that sleep when idle (such as Render's) add a cold start for the first visitor; because live state is in Redis, games survive such restarts.
+Everything needed is in [`deploy/`](./deploy): `docker-compose.prod.yml`, `Caddyfile`, `.env.example` and a step-by-step [`DEPLOY.md`](./deploy/DEPLOY.md). To deploy your own copy:
+
+```bash
+cp deploy/.env.example deploy/.env      # fill in the five values
+docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env up -d --build
+```
+
+`NEXT_PUBLIC_*` values are baked into the client at build time, so changing the API address means rebuilding the client. The server holds long-lived WebSocket connections and a 1-second sweeper, so it needs a host that keeps a Node process running rather than serverless functions.
+
 
 ---
 
